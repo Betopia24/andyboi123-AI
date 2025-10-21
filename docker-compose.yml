@@ -1,0 +1,11 @@
+services:
+  app:
+    build: .
+    container_name: andy
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env          # 👈 tell Docker to load .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
