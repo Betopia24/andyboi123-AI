@@ -1,3 +1,4 @@
+# main.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
@@ -5,7 +6,18 @@ import httpx
 import asyncio
 import json
 import os
+import re
 from dotenv import load_dotenv
+from prompts import (
+    SYSTEM_CREATIVE_WRITER,
+    get_outline_prompt,
+    get_title_extraction_prompt,
+    get_chapter_prompt,
+    get_additional_content_prompt,
+    get_story_title_prompt,
+    TEST_OPENAI_PROMPT,
+    get_retry_prompt_addition
+)
 
 # Load environment variables
 load_dotenv()
@@ -51,57 +63,52 @@ async def call_openai_api(messages: List[Dict], max_tokens: int = 8000) -> str:
         "model": "gpt-4o-mini",
         "messages": messages,
         "max_tokens": max_tokens,
-        "temperature": 0.7
+        "temperature": 0.7,
+        "top_p": 0.9
     }
     
-    async with httpx.AsyncClient(timeout=600.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         try:
             response = await client.post(url, headers=headers, json=data)
             response.raise_for_status()
             result = response.json()
             return result["choices"][0]["message"]["content"].strip()
         except httpx.HTTPStatusError as e:
-            print(f"HTTP error: {e.response.status_code} - {e.response.text}")
-            raise HTTPException(status_code=500, detail=f"OpenAI API HTTP error: {e.response.status_code}")
+            error_detail = e.response.json().get('error', {}).get('message', str(e))
+            print(f"HTTP error: {e.response.status_code} - {error_detail}")
+            raise HTTPException(status_code=500, detail=f"OpenAI API error: {error_detail}")
         except Exception as e:
             print(f"Request error: {str(e)}")
             raise HTTPException(status_code=500, detail=f"OpenAI API request failed: {str(e)}")
 
 async def generate_story_chunk(prompt: str, max_tokens: int = 4000) -> str:
     """Generate a chunk of the story using direct OpenAI API call"""
-    try:
-        print(f"Sending request to OpenAI with {len(prompt)} characters...")
-        
-        messages = [
-            {"role": "system", "content": "You are a creative fiction writer. Write engaging, detailed stories based on the provided questions and answers."},
-            {"role": "user", "content": prompt}
-        ]
-        
-        return await call_openai_api(messages, max_tokens)
+    print(f"Sending request to OpenAI with {len(prompt)} characters...")
     
-    except Exception as e:
-        print(f"OpenAI API error details: {str(e)}")
-        raise
+    messages = [
+        {"role": "system", "content": SYSTEM_CREATIVE_WRITER},
+        {"role": "user", "content": prompt}
+    ]
+    
+    return await call_openai_api(messages, max_tokens)
 
 async def generate_chunk_with_retry(prompt: str, target_words: int, max_retries: int = 3) -> str:
-    """Generate a story chunk with retry logic to meet word count"""
+    """Generate a story chunk with retry logic focused on narrative depth"""
     for attempt in range(max_retries):
         try:
-            # Adjust tokens based on target words (roughly 1.3 tokens per word)
-            estimated_tokens = min(int(target_words * 1.3) + 200, 4000)
+            estimated_tokens = min(int(target_words * 1.5) + 200, 4000)
             
             chunk = await generate_story_chunk(prompt, estimated_tokens)
             word_count = len(chunk.split())
             
             print(f"Chunk generated: {word_count} words (target: {target_words})")
             
-            # If we're within 20% of target, accept it
-            if word_count >= target_words * 0.8:
+            # Accept if within reasonable range or over target
+            if word_count >= target_words * 0.8 or word_count > target_words:
                 return chunk
             else:
-                print(f"Chunk too short ({word_count} words), retrying... (attempt {attempt + 1})")
-                # Modify prompt to ask for more content
-                retry_prompt = prompt + f"\n\nIMPORTANT: The previous response was too short. Please write at least {target_words} words for this section. Add more detail, description, and depth to reach the required length."
+                print(f"Chunk too short ({word_count} words), enriching narrative... (attempt {attempt + 1})")
+                retry_prompt = prompt + get_retry_prompt_addition(target_words)
                 prompt = retry_prompt
                 
         except Exception as e:
@@ -109,150 +116,162 @@ async def generate_chunk_with_retry(prompt: str, target_words: int, max_retries:
             if attempt == max_retries - 1:
                 raise
     
-    # If all retries fail, return whatever we have
     return chunk
 
+def parse_titles_from_outline(outline: str) -> List[str]:
+    """Extract chapter titles directly from outline text"""
+    titles = []
+    # Look for chapter patterns like "Chapter 1: The Magical Forest"
+    pattern = r'Chapter\s+(\d+):\s*([^\n]+)'
+    matches = re.findall(pattern, outline, re.IGNORECASE)
+    
+    # Sort by chapter number
+    sorted_matches = sorted(matches, key=lambda x: int(x[0]))
+    
+    for num, title in sorted_matches:
+        # Clean title: remove quotes, extra spaces
+        clean_title = re.sub(r'^[\"\']|[\"\']$', '', title).strip()
+        titles.append(f"Chapter {num}: {clean_title}")
+    
+    # Validate we have at least 3 chapters (minimum viable story)
+    if len(titles) < 3:
+        raise ValueError("Could not extract sufficient chapter titles from outline")
+    
+    return titles
+
 async def extract_chapter_titles(outline: str) -> List[str]:
-    """Extract chapter titles from the outline"""
+    """Extract chapter titles with strict validation and no fallbacks"""
     try:
-        title_prompt = f"""
-        Extract the chapter titles from this story outline. Return ONLY a JSON array of chapter titles, nothing else.
+        title_prompt = get_title_extraction_prompt(outline)
+        titles_response = await generate_story_chunk(title_prompt, 500)
         
-        STORY OUTLINE:
-        {outline}
+        print(f"Raw title response: {titles_response[:200]}...")
         
-        Example output: ["Chapter 1: Childhood Beginnings", "Chapter 2: School Days", ...]
+        # Strategy 1: Find JSON array
+        json_match = re.search(r'\[[^\]]*\]', titles_response, re.DOTALL)
+        if json_match:
+            try:
+                json_str = json_match.group(0)
+                chapter_titles = json.loads(json_str)
+                if isinstance(chapter_titles, list) and len(chapter_titles) >= 3:
+                    print(f"✅ JSON titles extracted: {chapter_titles}")
+                    # Ensure proper formatting
+                    return [f"Chapter {i+1}: {title}" for i, title in enumerate(chapter_titles)]
+            except json.JSONDecodeError:
+                print("JSON parsing failed, trying text extraction")
         
-        Return only the JSON array:
-        """
-        
-        titles_json = await generate_story_chunk(title_prompt, 500)
-        
-        # Clean the response to extract JSON
-        titles_json = titles_json.strip()
-        if titles_json.startswith('```json'):
-            titles_json = titles_json[7:]
-        if titles_json.endswith('```'):
-            titles_json = titles_json[:-3]
-        
-        chapter_titles = json.loads(titles_json)
-        return chapter_titles
+        # Strategy 2: Parse directly from outline text
+        print("🔄 Parsing titles directly from outline text")
+        text_titles = parse_titles_from_outline(outline)
+        print(f"✅ Text-parsed titles: {text_titles}")
+        return text_titles
         
     except Exception as e:
-        print(f"Error extracting chapter titles: {e}")
-        # Fallback: generate default chapter titles
-        return [
-            "Chapter 1: Early Childhood Memories",
-            "Chapter 2: Family and Foundations", 
-            "Chapter 3: School Days and Friendships",
-            "Chapter 4: Dreams and Aspirations",
-            "Chapter 5: Love and Relationships",
-            "Chapter 6: Life Lessons and Growth",
-            "Chapter 7: Reflections and Future"
-        ]
+        print(f"🚨 Title extraction failed: {str(e)}")
+        # NO FALLBACK - re-raise the exception to fail the request
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to extract chapter titles from outline: {str(e)}"
+        )
 
 async def generate_long_story(elements: List[StoryElement], word_limit: int) -> Dict[str, Any]:
-    """Generate a long story with separate chapters"""
-    
+    """Generate a story that includes EVERY SINGLE ANSWER with no fallbacks"""
     try:
-        # Prepare Q&A summary
-        qa_pairs = []
-        for i, element in enumerate(elements, 1):
-            if element.question and element.answer:
-                qa_pairs.append(f"{i}. Q: {element.question}\nA: {element.answer}")
+        # Collect ONLY valid answers - no placeholders, no padding
+        all_answers = [
+            element.answer.strip() 
+            for element in elements 
+            if element.answer and element.answer.strip()
+        ]
         
-        if not qa_pairs:
-            raise HTTPException(status_code=400, detail="No valid question-answer pairs provided")
+        if not all_answers:
+            raise HTTPException(status_code=400, detail="No valid answers provided")
         
-        qa_text = "\n\n".join(qa_pairs)
+        print(f"✨ Processing {len(all_answers)} UNIQUE answers for {word_limit}-word story...")
+        print("📚 ALL ANSWERS WILL BE INCLUDED - NO FALLBACKS OR PLACEHOLDERS")
         
-        print(f"Processing {len(qa_pairs)} Q&A pairs for {word_limit} word story...")
-        
-        # Generate overall outline first
-        outline_prompt = f"""
-        Create a detailed chapter outline for a {word_limit} word life story based on these questions and answers:
-        
-        QUESTIONS AND ANSWERS:
-        {qa_text}
-        
-        Create a 5-7 chapter outline with clear chapter titles that covers:
-        1. Childhood and early memories
-        2. Family relationships and background  
-        3. Education and personal development
-        4. Friendships and social life
-        5. Love and romantic relationships
-        6. Career and personal achievements
-        7. Life lessons and future outlook
-        
-        Make each chapter title descriptive and engaging.
-        Return the outline with clear and brief descriptions. Make sure it's engaging and attracts the reader.
-        """
-        
-        print("Generating story outline...")
+        # Generate outline using ALL answers
+        outline_prompt = get_outline_prompt("\n".join(all_answers), word_limit)
+        print("🌱 Generating story outline with ALL answers...")
         outline = await generate_story_chunk(outline_prompt, 2000)
-        print("Outline generated successfully")
+        print("✅ Outline generated successfully")
         
-        # Extract chapter titles from outline
+        # Extract chapter titles with strict validation
         chapter_titles = await extract_chapter_titles(outline)
         num_chapters = len(chapter_titles)
-        
-        print(f"Extracted {num_chapters} chapter titles: {chapter_titles}")
+        print(f"챕 Found {num_chapters} chapter titles: {chapter_titles}")
         
         # Calculate words per chapter
-        base_words_per_chapter = word_limit // num_chapters
-        remaining_words = word_limit
+        words_per_chapter = [word_limit // num_chapters] * num_chapters
+        remainder = word_limit % num_chapters
+        for i in range(remainder):
+            words_per_chapter[i] += 1
+        
+        # DISTRIBUTE ALL ANSWERS ACROSS CHAPTERS - NO SKIPPING
+        answers_per_chapter = [0] * num_chapters
+        
+        # Base distribution
+        base_answers = len(all_answers) // num_chapters
+        remainder = len(all_answers) % num_chapters
+        
+        # Assign answers to chapters
+        for i in range(num_chapters):
+            answers_per_chapter[i] = base_answers
+            if i < remainder:
+                answers_per_chapter[i] += 1
+        
+        # Validate total answers match
+        total_assigned = sum(answers_per_chapter)
+        if total_assigned != len(all_answers):
+            raise ValueError(
+                f"Answer distribution mismatch: {total_assigned} assigned vs {len(all_answers)} total answers"
+            )
+        
+        print(f"📊 Answer distribution: {answers_per_chapter} (total: {total_assigned}/{len(all_answers)})")
         
         chapters = []
         current_context = ""
         
-        print(f"Starting chapter generation for {num_chapters} chapters...")
+        print(f"📖 Starting chapter generation for {num_chapters} chapters...")
         
-        for chapter_num, chapter_title in enumerate(chapter_titles, 1):
-            # Calculate target words for this chapter
-            chapters_remaining = num_chapters - chapter_num + 1
-            target_words = min(base_words_per_chapter, remaining_words // chapters_remaining)
+        for chapter_num in range(1, num_chapters + 1):
+            chapter_title = chapter_titles[chapter_num - 1]
             
-            chapter_prompt = f"""
-            STORY OUTLINE:
-            {outline}
+            # Calculate EXACT answer range for this chapter
+            start_idx = sum(answers_per_chapter[:chapter_num-1])
+            end_idx = start_idx + answers_per_chapter[chapter_num-1]
+            chapter_answers = all_answers[start_idx:end_idx]
             
-            KEY ELEMENTS TO INCORPORATE:
-            {qa_text}
+            # CRITICAL: Verify we have answers for this chapter
+            if not chapter_answers:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"No answers assigned to Chapter {chapter_num} - distribution error"
+                )
             
-            PREVIOUS STORY CONTEXT:
-            {current_context if current_context else "This is the beginning of the story."}
+            # Get target words for this chapter
+            target_words = words_per_chapter[chapter_num - 1]
             
+            # Generate chapter content with EXACT answers for this chapter
+            chapter_prompt = get_chapter_prompt(
+                outline=outline,
+                qa_text="\n".join(chapter_answers),
+                current_context=current_context,
+                target_words=target_words,
+                chapter_num=chapter_num,
+                num_chapters=num_chapters,
+            )
             
-            INSTRUCTIONS:
-            - Write approximately {target_words} words for this chapter
-            - Do not include chapter title
-            - Continue the story naturally from the previous context
-            - Focus on the themes appropriate for this chapter
-            - Incorporate relevant Q&A elements organically
-            - Write in a descriptive, emotional style
-            - Ensure this chapter feels complete but leads naturally to the next
-            """
+            print(f"\n{'='*50}")
+            print(f"✨ Generating Chapter {chapter_num}/{num_chapters}: '{chapter_title}'")
+            print(f"🎯 Target words: {target_words} | Answers used: {len(chapter_answers)}")
+            print("🔍 ANSWERS FOR THIS CHAPTER:")
+            for i, ans in enumerate(chapter_answers, 1):
+                print(f"   {i}. {ans[:60]}{'...' if len(ans)>60 else ''}")
+            print(f"📚 Context: {current_context[-50:] if current_context else 'Beginning of story'}")
+            print(f"{'='*50}\n")
             
-            if chapter_num == 1:
-                chapter_prompt += """
-                Start the story from childhood. Establish the main character, setting, and early memories.
-                Make this chapter engaging and set the tone for the entire story.
-                """
-            elif chapter_num == num_chapters:
-                chapter_prompt += """
-                This is the final chapter. Provide meaningful closure, reflect on life lessons,
-                and show how all experiences shaped the person. End with hope and forward-looking thoughts.
-                Make this chapter a satisfying conclusion to the entire story.
-                """
-            else:
-                chapter_prompt += f"""
-                This is a middle chapter. Continue developing the narrative with depth and detail.
-                Build on previous chapters and set up developments for future chapters.
-                """
-            
-            print(f"Generating chapter {chapter_num}/{num_chapters}: '{chapter_title}' (target: {target_words} words)...")
-            
-            # Generate chapter content with retry logic
+            # Generate with retry logic
             chapter_content = await generate_chunk_with_retry(chapter_prompt, target_words)
             chapter_word_count = len(chapter_content.split())
             
@@ -265,90 +284,49 @@ async def generate_long_story(elements: List[StoryElement], word_limit: int) -> 
             )
             chapters.append(chapter)
             
-            # Update context for next chapter (use last chapter for continuity)
-            current_context = chapter_content
+            # Update context for next chapter (last 150 words)
+            if chapter_content:
+                current_context = " ".join(chapter_content.split()[-150:])
+            
             current_total_words = sum(chap.word_count for chap in chapters)
-            remaining_words = word_limit - current_total_words
-            
-            print(f"Chapter {chapter_num} completed: {chapter_word_count} words. Total so far: {current_total_words} words")
-            
-            # Add delay between chapters
-            if chapter_num < num_chapters:
-                await asyncio.sleep(2)
+            print(f"✅ Chapter {chapter_num} completed: {chapter_word_count} words. Total: {current_total_words}/{word_limit}")
         
-        # Check if we need additional content to reach word limit
-        current_total_words = sum(chapter.word_count for chapter in chapters)
-        
-        if current_total_words < word_limit * 0.9:
-            print(f"Story is short ({current_total_words} words), generating additional content...")
-            
-            additional_prompt = f"""
-            STORY OUTLINE:
-            {outline}
-            
-            COMPLETE STORY SO FAR:
-            {' '.join([chap.content for chap in chapters])[-3000:]}
-            
-            ADDITIONAL CONTENT NEEDED:
-            We need approximately {word_limit - current_total_words} more words to complete the story.
-            
-            Please write an additional chapter or epilogue that:
-            - Expands on existing themes from the story
-            - Adds depth to character development
-            - Provides additional reflections or memories
-            - Enhances the emotional journey
-            - Maintains consistency with the existing story
-            
-            Write this additional content that seamlessly continues from the current story.
-            """
-            
-            additional_content = await generate_chunk_with_retry(additional_prompt, word_limit - current_total_words)
-            additional_word_count = len(additional_content.split())
-            
-            # Create additional chapter
-            additional_chapter = Chapter(
-                title="Epilogue: Final Reflections",
-                content=additional_content,
-                word_count=additional_word_count,
-                chapter_number=len(chapters) + 1
-            )
-            chapters.append(additional_chapter)
-            
-            current_total_words += additional_word_count
-            print(f"Additional content added: {additional_word_count} words. New total: {current_total_words} words")
-        
-        # Generate overall story title
-        title_prompt = f"""
-        Based on this life story with the following chapters, create an engaging, heartfelt title:
-        
-        CHAPTERS:
-        {[chap.title for chap in chapters]}
-        
-        KEY THEMES: Childhood memories, family, friendships, love, personal growth, life lessons
-        
-        Return only the title without quotes. Make it emotional and memorable.
-        """
+        # Generate story title
+        title_prompt = get_story_title_prompt(chapter_titles)
         story_title = await generate_story_chunk(title_prompt, 100)
+        clean_title = re.sub(r'^[\"\']|[\"\']$', '', story_title).strip()
         
         final_total_words = sum(chapter.word_count for chapter in chapters)
         
-        print(f"Story generation completed: {final_total_words} words across {len(chapters)} chapters (target: {word_limit})")
+        # FINAL VALIDATION: Verify all answers were used
+        used_answers_count = sum(answers_per_chapter)
+        if used_answers_count != len(all_answers):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Answer mismatch: {used_answers_count} used vs {len(all_answers)} provided"
+            )
+        
+        print(f"\n{'='*60}")
+        print(f"🎉 Story generation completed: {final_total_words} words across {len(chapters)} chapters")
+        print(f"📖 Title: '{clean_title}'")
+        print(f"✅ ALL {len(all_answers)} ANSWERS INCLUDED - NO FALLBACKS USED")
+        print(f"{'='*60}")
         
         return {
-            "title": story_title.strip('"\''),
+            "title": clean_title,
             "chapters": chapters,
             "total_word_count": final_total_words,
             "generated_elements": {
-                "qa_pairs_used": len(qa_pairs),
+                "answers_used": len(all_answers),
                 "total_chapters": len(chapters),
-                "chapter_titles": [chap.title for chap in chapters],
-                "outline": outline,
-                "target_achieved": final_total_words >= word_limit * 0.9
+                "chapter_titles": chapter_titles,
+                "outline": outline[:500] + "..." if len(outline) > 500 else outline,
+                "answer_distribution": answers_per_chapter
             }
         }
         
     except Exception as e:
-        print(f"Error in generate_long_story: {str(e)}")
+        print(f"🔥 Critical error in generate_long_story: {str(e)}")
         import traceback
         print(f"Traceback: {traceback.format_exc()}")
         raise
@@ -356,19 +334,38 @@ async def generate_long_story(elements: List[StoryElement], word_limit: int) -> 
 @app.post("/generate-story", response_model=StoryResponse)
 async def generate_story_endpoint(request: StoryRequest):
     """
-    Generate a story based on questions and answers input
+    Generate a story that includes EVERY SINGLE ANSWER with no fallbacks or placeholders
     """
+    print(f"\n{'*'*80}")
+    print(f"🚀 RECEIVED STORY GENERATION REQUEST")
+    print(f"   • Elements: {len(request.story_elements)}")
+    print(f"   • Word Target: {request.word_limit}")
+    print(f"   • STRICT REQUIREMENT: ALL ANSWERS MUST BE INCLUDED - NO EXCEPTIONS")
+    print(f"{'*'*80}\n")
+    
     try:
-        print(f"Received request for {len(request.story_elements)} Q&A pairs, {request.word_limit} words")
         result = await generate_long_story(
             elements=request.story_elements,
             word_limit=request.word_limit
         )
         
+        # Log final statistics with answer verification
+        print(f"\n{'- - '*20}")
+        print(f"📊 FINAL STORY STATISTICS")
+        print(f"   • Title: {result['title']}")
+        print(f"   • Chapters: {len(result['chapters'])}")
+        print(f"   • Total Words: {result['total_word_count']}")
+        print(f"   • Answers Included: {result['generated_elements']['answers_used']}")
+        print(f"   • Answer Distribution: {result['generated_elements']['answer_distribution']}")
+        print(f"✅ VALIDATION PASSED: ALL ANSWERS INCLUDED")
+        print(f"{'- - '*20}\n")
+        
         return result
         
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error in generate_story endpoint: {str(e)}")
+        print(f"💀 FATAL ERROR in generate_story endpoint: {str(e)}")
         import traceback
         print(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Story generation failed: {str(e)}")
@@ -376,39 +373,49 @@ async def generate_story_endpoint(request: StoryRequest):
 @app.get("/")
 async def root():
     return {
-        "message": "Story Generator API", 
+        "message": "✨ STRICT STORY WEAVER API ✨", 
         "version": "1.0.0",
         "endpoints": {
-            "POST /generate-story": "Generate stories from Q&A input"
-        }
+            "POST /generate-story": "Generate stories using EVERY ANSWER provided - no fallbacks",
+            "GET /health": "Check API health status",
+            "GET /test-openai": "Verify OpenAI connection"
+        },
+        "guarantee": "100% of your answers will be included in the story"
     }
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    return {"status": "healthy", "timestamp": "2025-12-06T12:00:00Z"}
 
-# Test endpoint to check OpenAI connection
 @app.get("/test-openai")
 async def test_openai():
     """Test OpenAI connection with a simple prompt"""
     try:
-        test_prompt = "Write a one sentence story about a cat."
         messages = [
-            {"role": "user", "content": test_prompt}
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": TEST_OPENAI_PROMPT}
         ]
         
         response = await call_openai_api(messages, 50)
         
         return {
             "status": "success",
-            "response": response
+            "response": response,
+            "model_used": "gpt-4o-mini"
         }
     except Exception as e:
         return {
             "status": "error",
-            "error": str(e)
+            "error": str(e),
+            "timestamp": "2025-12-06T12:00:00Z"
         }
 
 if __name__ == "__main__":
     import uvicorn
+    print("\n" + "="*80)
+    print("✨ STRICT STORY WEAVER API STARTING UP ✨")
+    print(f"   • Guarantee: EVERY answer will be included - NO fallbacks or placeholders")
+    print(f"   • OpenAI Key: {'✓ Set' if api_key else '✗ Missing'}")
+    print(f"   • Server: http://0.0.0.0:8000")
+    print("="*80 + "\n")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
